@@ -1,0 +1,704 @@
+---
+title: "Basic Guide for the Differential Expression Analysis of RNAseq data using DESeq2"
+author: "David Requena - drequena@rockefeller.edu"
+date: "Original: 11/17/2017 | Updated: 01/03/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Guide for the Differential Expression Analysis of RNAseq data using DESeq2
+
+## 1. SET UP
+
+### Install and/or call the required libraries
+
+This first block is just to install the dependencies. If already installed, don't run this block.
+```{r Install libraries, eval=TRUE, echo=FALSE}
+# # Import necessary libraries
+install.packages('knitr')
+install.packages('matrixStats')
+install.packages('RColorBrewer')
+install.packages('gplots')
+install.packages('ggplot2')
+install.packages('ggrepel')
+install.packages('tsne')
+install.packages('BatchJobs')
+install.packages('gridExtra')
+
+source("https://bioconductor.org/biocLite.R")
+biocLite("XML") #In linux, first do: sudo apt-get install libxml2-dev
+biocLite("BiocParallel", dependencies=TRUE)
+biocLite("DESeq2", dependencies=TRUE)
+biocLite("biomaRt", dependencies=TRUE)
+biocLite("pheatmap", dependencies=TRUE)
+```
+
+This block is to call all the required libraries:
+```{r, echo=FALSE}
+# library("XML")
+library("knitr", quietly = T)
+library("DESeq2", quietly = T)
+library("biomaRt", quietly = T)
+library("matrixStats", quietly = T)
+library("BatchJobs", quietly = T)
+library("BiocParallel", quietly = T)
+library("scales", quietly = T)
+library("RColorBrewer", quietly = T)
+library("gplots", quietly = T)
+library("ggplot2", quietly = T)
+library("ggrepel", quietly = T)
+library("gridExtra", quietly = T)
+library("tsne", quietly = T)
+library("pheatmap", quietly = T)
+library("grDevices", quietly = T)
+```
+
+### Input sample metadata
+
+In this block, you just need to change the working directory:
+```{r "setup"}
+# require("knitr")
+knitr::opts_knit$set(root.dir = ".") # <<<------------- *** WORKING DIRECTORY ***
+
+# These two tables have to be in your working directory:
+# - A table containing the samples' data (features of interest) and
+# - A table with the gene counts by sample
+sample_data <- "samples_data.tsv"
+counts_data <- "counts_data.tsv"
+```
+
+This block is to read the samples' data.
+There is also an option to work with subsets.
+```{r, echo=FALSE}
+#########################
+# Input sample metadata #
+#########################
+sampledata <- data.frame(read.csv(sample_data, sep = "\t", header = TRUE))
+
+droplevels(sampledata$sample_id)
+
+# To sort the table by sample name:
+sampledata <- sampledata[order(sampledata$sample_id), ]
+rownames(sampledata) <- sampledata$sample_id
+```
+
+This block is to read the tables with the counts.
+There is also an option to filter out some genes (blacklist).
+```{r, echo=FALSE}
+######################
+# Input counts table #
+######################
+countstable <- data.frame(read.csv(counts_data, sep = "\t", header = FALSE), stringsAsFactors = FALSE)
+
+# Filter out some genes in a pre defined black list:
+blacklist <- data.frame(read.csv("blacklist.tsv", sep = "\t", header = TRUE))
+countstable <- countstable[!(countstable[,1] %in% blacklist[,1]), ]
+
+# Save the gene list, to be used later as row names:
+generows <- unlist(countstable[,1], use.names=FALSE)
+generows <- generows[-1]
+invisible(droplevels(generows))
+
+# This column contains the gene names, we don't need it anymore:
+countstable[,1] <- NULL
+
+# Sort the table by sample name:
+countstable.sorted <- countstable[,order(countstable[1,])]
+
+# Save the samples list, to be used later as column names:
+genecols <- unlist(countstable.sorted[1,], use.names=FALSE)
+droplevels(genecols)
+
+# Convert the values on the table from characters to numbers:
+# First, any string should be removed (names on the first row)
+countstable.sorted <- countstable.sorted[-1,]
+# Then, do the conversion
+countstable.num <- as.data.frame(apply(countstable.sorted, c(1,2), as.integer))
+# Finally, add the row and column names:
+rownames(countstable.num) <- generows
+colnames(countstable.num) <- genecols
+
+# If the sampledata table was filtered in the chunk above, this line will filter
+# the countstable as well. If not, this will do nothing:
+countstable.num <- countstable.num[colnames(countstable.num) %in% sampledata$sample_id]
+
+#####################
+# Remove empty rows #
+#####################
+# Keep this line if you wanna see the last bar of the histogram of counts below
+countstable.num <- countstable.num[ rowSums(countstable.num) > 0, ]
+```
+
+### Create the DESeq2 object
+With no specific design, but indicating the base level
+```{r, echo=FALSE}
+################
+# DESeq Object #
+################
+
+# This is to reate a DESeqDataSet from the tables above, with no specific design yet:
+ds.deseq <- DESeqDataSetFromMatrix(
+  countData = countstable.num,
+  colData = sampledata,
+  design = ~ sample_type)
+
+# To see which is the current base level:
+str(colData(ds.deseq)$sample_type)
+# To indicate the base level: sample_type == Normal
+colData(ds.deseq)$sample_type  <- factor(colData(ds.deseq)$sample_type,
+                                         levels = c("Normal", "Tumor"))
+# To see the current base level
+str(colData(ds.deseq)$sample_type)
+```
+
+## 2. Explore the data
+This step is necessary to determine which variables we should control by. Also, to identify outliers.
+
+### Transformations of the Data
+To adjust by known effects
+```{r, echo=FALSE}
+######################################
+# Variance stabilized transformation #
+######################################
+transf.data <- varianceStabilizingTransformation(ds.deseq)
+head(assay(transf.data))
+
+#######################
+# rLog transformation #
+#######################
+# transf.data <- rlog(ds.deseq)
+# head(assay(transf.data))
+```
+
+### PCA plot
+
+#### Function to make nice PCA plots
+```{r, eval = TRUE}
+######################
+# plotPCAdr function #
+######################
+# This is the plotPCA function from DESeq2, made by Wolfgang Huber
+# But including some improvements made by David Requena
+# Now this allows to choose which PCs plot and to use two features for color/shape
+
+plotPCA_DR <- function (object, intgroup = "condition", ntop = 500, PCs = c(1,2),
+                        size = 7, alpha = 1, colors = NULL, returnData = FALSE) 
+{
+  # Get the name of the PCs to analyze
+  PC_x <- paste("PC", PCs[1], sep = "")
+  PC_y <- paste("PC", PCs[2], sep = "")
+  
+  # Principal Component Analysis
+  rv <- rowVars(assay(object))
+  select <- order(rv, decreasing = TRUE)[seq_len(min(ntop, length(rv)))]
+  pca <- prcomp(t(assay(object)[select, ]))
+  percentVar <- pca$sdev^2 / sum(pca$sdev^2)
+  if (!all(intgroup %in% names(colData(object)))) {
+    stop("the argument 'intgroup' should specify columns of colData(dds)")
+  }
+
+  # Alternatively, return the list of values by PC
+  # return(pca$x)
+  # return(pca$x[, c(PCs[1], PCs[2])])
+  
+  # Varuables to use in the plots to assing shape, color, fill, etc.
+  intgroup.df <- as.data.frame(colData(object)[, intgroup, drop = FALSE])
+  
+  # To use different shapes and fill using different colors
+  d <- data.frame(PCx = pca$x[, PCs[1]], PCy = pca$x[, PCs[2]],
+                  to_fill = factor(intgroup.df[,1]), to_shape = factor(intgroup.df[,2]),
+                  name = colnames(object))
+
+  if (returnData) {
+    attr(d, "percentVar") <- percentVar[PCs[1]:PCs[2]]
+    return(d)
+  }
+
+  ggplot(data = d, aes_string(x = "PCx", y = "PCy", fill = "to_fill", shape = "to_shape")) +
+    labs(fill = intgroup[1], shape = intgroup[2]) + geom_point(size = size, alpha = alpha) +
+    scale_fill_manual(values = colors, guide = guide_legend(override.aes = aes(shape = 21, size = 7))) +
+    scale_shape_manual(values = c(22, 21), guide = guide_legend(override.aes = aes(size = 7))) +
+    coord_fixed() + theme_bw() +
+    xlab(paste0(PC_x, ": ", round(percentVar[PCs[1]] * 100), "% variance")) +
+    ylab(paste0(PC_y, ": ", round(percentVar[PCs[2]] * 100), "% variance"))
+  
+}
+```
+
+Making some PCA plots
+```{r, eval = TRUE}
+#######################
+# Make some PCA plots #
+#######################
+# Using a simple method to plot the PCs:
+pr <- prcomp(t(assay(transf.data)))
+
+# Colors for presentations and posters:
+# Put as many colors as categories you have
+nice_colors <- c("lightgoldenrodyellow", "khaki2", "burlywood1", "rosybrown1", "salmon1", "orangered", "white")
+
+# Plot PCs using the function defined above:
+
+# PC 1 vs 2
+pca12 <- plotPCA_DR(transf.data, intgroup = c("tumor_stage", "sample_type"), PCs = c(1,2),
+                   colors = nice_colors, ntop =  nrow(assay(transf.data)), size = 12, alpha = 0.9) +
+  labs(fill = expression(underline("Tumor Stage")), shape = expression(underline("Tissue Type"))) +
+  geom_text(aes(label= transf.data$sample_id), size = 4)
+
+# PC 2 vs 3
+pca23 <- plotPCA_DR(transf.data, intgroup = c("tumor_stage", "sample_type"), PCs = c(2,3),
+                   colors = nice_colors, ntop =  nrow(assay(transf.data)), size = 12, alpha = 0.9) +
+  labs(fill = expression(underline("Tumor Stage")), shape = expression(underline("Tissue Type")))
+  #+ geom_text(aes(label= transf.data$sample_id), size = 4)
+
+pca34 <- plotPCA_DR(transf.data, intgroup = c("tumor_stage", "sample_type"), PCs = c(3,4),
+                   colors = nice_colors, ntop =  nrow(assay(transf.data)), size = 12, alpha = 0.9) +
+  labs(fill = expression(underline("Tumor Stage")), shape = expression(underline("Tissue Type")))
+  #+ geom_text(aes(label= transf.data$sample_id), size = 4)
+
+
+#############################
+# Show the 3 PCA plots made #
+#############################
+# It's important to first examine the plots with the samples de-identified, to see if any cluster can be recognized without any bias.
+# In the following plots, the de-identified version is printed before the identified one:
+
+# PC 1 vs 2:
+############
+# No labels
+plot(pr$x[,], pch = 21, bg = alpha("gray40", 0.5), cex = 3.5)
+# Labels, colors and shapes
+pca12
+
+# PC 2 vs 3:
+############
+# No labels
+plot(pr$x[, -1], pch = 21, bg = alpha("gray40", 0.5), cex = 3.5)
+# Labels, colors and shapes
+pca23
+
+# PC 3 vs 4:
+############
+# No labels
+plot(pr$x[, -c(1,2)], pch = 21, bg = alpha("gray40", 0.5), cex = 3.5)
+# Labels, colors and shapes
+pca34
+
+# To save the figures:
+ggsave("PCA12_clean.jpg", width = 8, height = 10, dpi = 300,
+       plot(pr$x[,], pch = 21, bg = alpha("gray40", 0.5), cex = 3.5))
+ggsave("PCA23_clean.svg", width = 8, height = 6, dpi = 300,
+       plot(pr$x[, -1], pch = 21, bg = alpha("gray40", 0.5), cex = 3.5))
+ggsave("PCA12.jpg", pca23, width = 8, height = 6, dpi = 300)
+ggsave("PCA23.jpg", pca23, width = 8, height = 6, dpi = 300)
+ggsave("PCA34.jpg", pca23, width = 8, height = 6, dpi = 300)
+
+
+# This is to extract the individual gene contribution in PC1
+# gene_contribution <- sort(abs(pr$rotation[,1]), decreasing = TRUE)[1:100]
+# as.data.frame(gene_contribution)
+# sort(abs(pr$rotation[,1]), decreasing = TRUE)
+# write.csv(sort(abs(pr$rotation[,1]), decreasing = TRUE), file = "PC1.csv")
+```
+
+### tSNE plot
+```{r, echo=FALSE}
+# Calculate the euclidean distances between samples
+sampleDists <- dist(t(assay(transf.data)))
+
+# Perplexity is set to 4 because this is our average number of samples by patient (neighbors in a set)
+samples.tsne <- tsne(sampleDists, perplexity = 4, max_iter = 10000, epoch=1000)
+
+df.tsne <- data.frame(samples.tsne)
+df.tsne$sample_id <- sampledata$sample_id
+df.tsne$tumor_stage <- sampledata$tumor_stage
+df.tsne$sample_type <- sampledata$sample_type
+
+# Size recommended for posters
+# Warning: The legend could ovelap the datapoints. Set appropriate coordinates.
+p.tsne_clean <- ggplot(data = df.tsne) + theme_bw() +
+  geom_point(aes(x = X1, y = X2), pch = 21, size = 12, fill = "gray40", alpha = 0.75) +
+  theme(axis.text.x = element_blank(), axis.text.y = element_blank())
+
+p.tsne_features <- ggplot(data = df.tsne, aes(x = X1, y = X2, shape = sample_type, fill = tumor_stage)) +
+  geom_point(color = "black", size = 12, alpha = 0.9) +  theme_bw() +
+  scale_shape_manual(values = c(22, 21),
+                     guide = guide_legend(override.aes = list(size = 7), keyheight = 1.7)) +
+  scale_fill_manual(values = nice_colors,
+                    guide = guide_legend(override.aes = aes(shape = 21, size = 9))) +
+  #geom_text(aes(label= patient), size = 6) +
+  theme(axis.text.x = element_blank(), axis.text.y = element_blank(), legend.position = c(0.06, 0.85),
+        legend.title = element_text(size = 20), legend.text=element_text(size = 16),
+        legend.background = element_rect(color = "black"), legend.box.just = "right") +
+  labs(fill = expression(underline("Tumor Stage")), shape = expression(underline("Sample Type"))) +
+  geom_text_repel(aes_string(label = df.tsne$sample_id), color = "black", cex = 4,
+                  min.segment.length = unit(0.1, "lines"), box.padding = unit(1, "lines"))
+
+p.tsne_clean
+p.tsne_features
+
+ggsave("tSNE_clean.jpg", p.tsne_clean, width = 16, height = 16, dpi = 300)
+ggsave("tSNE_features.jpg", p.tsne_features, width = 16, height = 16, dpi = 300)
+```
+
+### HeatMap
+```{r, echo=FALSE}
+sampleDistMatrix <- as.matrix(sampleDists)
+
+rownames(sampleDistMatrix) <- paste(transf.data$sample_id, transf.data$sample_type, sep = "_")
+colnames(sampleDistMatrix) <- paste(transf.data$sample_id, transf.data$sample_type, sep = "_")
+
+# Make heatmap based on the Distance matrix (uses all genes)
+heatmap.basic <- heatmap.2(sampleDistMatrix, margins = c(7.2, 7.2), offsetRow = 0, offsetCol = 0,
+                     trace="none", revC = TRUE, key = FALSE)
+
+ggsave("Heatmap_basic.jpg", width = 16, height = 16, dpi = 300,
+       heatmap.2(sampleDistMatrix, margins = c(7.2, 7.2), offsetRow = 0, offsetCol = 0,
+                 trace="none", revC = TRUE, key = FALSE))
+
+# To personalize the colors, use the folowwing line in the heatmap:
+# Colors = colorRampPalette(rev(brewer.pal(9, "Reds"))) (255)
+```
+
+## 3. Data Analysis
+
+### Model matrix
+Using the variables chosen from the results above, a model will be determined.
+If no other variable is gonna be included besides the sample type, don't run this chunk.
+A matrix representing this model is provided to DESeq2 in this step.
+```{r, echo=FALSE}
+################
+# Model Matrix #
+################
+
+# Define the model (design) to be used. In this case, the variable of interest is the sample type.
+# (normal, tumor or metastasis). And in this dataset, we have to control by:
+# library preparation -> lib_prep
+# patient -> lib_prep:nested_patient
+# Due patient is collinear with library prep, this should be represented by a combination
+# of lib_prep and a secondary variable (nested patient)
+# mm <- model.matrix(~ library_prep + patient + sample_type, colData(ds.deseq))
+
+# Sometimes, the resulting matrix has columns full of zeros. These should be removed:
+# mm <- mm[ , colSums(mm) > 0]
+```
+
+### Differential Expression Analsis
+```{r, echo=FALSE}
+# Number of cores of your computer:
+nc = 8
+
+# Run DESeq2 using the model defined above
+ds.deseq <- DESeq(ds.deseq, parallel = TRUE, BPPARAM=BatchJobsParam(workers = nc))
+
+# This will show the comparisons available, according to the design provided
+resultsNames(ds.deseq)
+
+# Cut off p-value
+cutoff_alpha <- 0.05
+# Cut off fold-change
+cutoff_fold <- 1
+
+# Get an specific result (see "help(results)" for info on this)
+res <- results(ds.deseq, name = "sample_type_Tumor_vs_Normal",
+               altHypothesis="greaterAbs",
+               alpha = cutoff_alpha,
+               pAdjustMethod = "BH") # Benjamini Hochberg = FDR
+
+# THis shows the number of up and down-regulated genes
+summary(res)
+```
+
+### Annotation and output tables
+This block is to add the names and description of the genes.
+```{r, echo=FALSE}
+#####################
+# Adding gene names #
+#####################
+res$ensembl <- rownames(res)
+
+ensembl = useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+# More annotations could also be added from biomaRt:
+# listAttributes(mart = ensembl)
+
+genemap <- getBM(attributes = c("ensembl_gene_id", "hgnc_symbol", "description"),
+                 filters = "ensembl_gene_id",
+                 values = res$ensembl,
+                 mart = ensembl)
+
+idx <- match(res$ensembl, genemap$ensembl_gene_id)
+res$symbol <- genemap$hgnc_symbol[idx]
+res$description <- genemap$description[idx]
+```
+
+This is to visualize a summary of the results and make some output tables in .csv format
+```{r, echo=FALSE}
+#########################################
+# Visualizing and filtering the results #
+#########################################
+
+write.csv(as.data.frame(res), file = "results_Tumor_vs_Normal_full.csv")
+
+table(res$padj < cutoff_alpha)
+table(abs(res$log2FoldChange) >= cutoff_fold)
+table((abs(res$log2FoldChange) >= cutoff_fold) & (res$padj < cutoff_alpha))
+
+res_sig <- subset(res, ( (padj < cutoff_alpha) & !is.na(padj) ))
+summary(res_sig)
+head(res_sig, n = 10)
+write.csv(as.data.frame(res_sig), file = "results_Tumor_vs_Normal_sig.csv")
+
+res_fold.over <- subset(res_sig, log2FoldChange >= cutoff_fold)
+res_fold.under <- subset(res_sig, log2FoldChange <= -cutoff_fold)
+
+summary(res_fold.over)
+summary(res_fold.under)
+
+res_fold.over.sorted <- res_fold.over[order(-res_fold.over$log2FoldChange, na.last=TRUE), ]
+res_fold.under.sorted <- res_fold.under[order(res_fold.under$log2FoldChange, na.last=TRUE), ]
+head(res_fold.over.sorted, n = 10)
+head(res_fold.under.sorted, n = 10)
+
+write.csv(as.data.frame(res_fold.over.sorted),
+          file = "results_Tumor_vs_Normal_over_(pval_filtered)_(fold_sorted).csv")
+write.csv(as.data.frame(res_fold.under.sorted),
+          file = "results_Tumor_vs_Normal_under_(pval_filtered)_(fold_sorted).csv")
+```
+
+## Plots
+This section is to generate some plots from the results:
+
+### Histogram of p-values
+```{r, echo=FALSE}
+# Including all the datapoints
+hist(res$pvalue, breaks=20, col="grey50", border="white")
+# Only those with base mean > 1
+hist(res$pvalue[res$baseMean > 1], breaks=20, col="grey50", border="white")
+```
+
+### Dispersion Estimates
+```{r, echo=FALSE}
+# DESeq2's dispersion estimates
+plotDispEsts(ds.deseq)
+```
+
+### MA Plot
+```{r, echo=FALSE}
+# The log2 fold change for a particular comparison is plotted on the y-axis
+# and the average of the counts normalized by size factor is shown on the x-axis
+# abs for minus, because a log ratio is equal to log minus log, and abs for average.
+
+# Specify one gene, to draw a circle around this point and add a label
+gene_c = "ENSG00000134827"
+
+plotMA(res, ylim=c(-5,5))
+with(res[gene_c, ], {
+  points(baseMean, log2FoldChange, col="dodgerblue", cex=2, lwd=2)
+  text(baseMean, log2FoldChange, gene_c, pos=2, col="dodgerblue")
+})
+```
+
+### Basic Volcano Plot
+```{r, echo=FALSE}
+############################
+# Basic Volcano Plot #
+############################
+plot(res$log2FoldChange, -log10(res$padj), pch = 16, cex = 0.5, las = 1,
+     xlab = "log2(Fold Change)", ylab = "-log10(p adjusted)")
+
+# To add labels (names of the genes): (Define first a condition)
+# text(x = res$log2FoldChange[cond], y = -log10(res$padj[cond]) + 0.1,
+#      labels = res$symbol[cond], cex = 0.7)
+
+# To draw vertical and horizontal lines
+abline(h = -log10(0.05), col = "green")
+abline(v = c(-1, 1), col = "green")
+abline(h = -log10(0.0001), col = "grey35")
+abline(v = c(-3, 3), col = "grey35")
+
+# To add a title
+title(main = "Tumor vs Normal")
+```
+
+
+### Nice Volcano Plot
+```{r, echo=FALSE}
+# New data frame for the volcano plot
+d.volcano <- data.frame(res)
+# To remove empty adjusted p-values
+d.volcano <- d.volcano[!is.na(d.volcano$padj), ]
+
+# Optional: This removes some extreme values, to reduce the range of the volcano plot for posters
+#d.volcano <- d.volcano[(abs(d.volcano$log2FoldChange) < 8) & (-log10(d.volcano$padj) < 7.5), ]
+
+# To fill the "empty" labels
+d.volcano$symbol[is.na(d.volcano$symbol) | (d.volcano$symbol == "")] <- "NS"
+
+# Additional cut-offs. The script will only add labels to those data points
+# passing a "nice" cutoff, for a better visualization:
+ctf_nice <- cutoff_alpha / 250
+fld_nice <- cutoff_fold * 4
+
+# Different colors for the datapoints, according to their relevance:
+d.volcano$colors <- rep("other", nrow(d.volcano))
+d.volcano$colors[(abs(d.volcano$log2FoldChange) <= cutoff_fold) & (d.volcano$padj >= cutoff_alpha)] <- "worst"
+d.volcano$colors[(abs(d.volcano$log2FoldChange) <= cutoff_fold) & (d.volcano$padj <= cutoff_alpha)] <- "middle"
+d.volcano$colors[(d.volcano$log2FoldChange >= cutoff_fold) & (d.volcano$padj < cutoff_alpha)] <- "over"
+d.volcano$colors[(d.volcano$log2FoldChange <= -cutoff_fold) & (d.volcano$padj < cutoff_alpha)] <- "under"
+
+# To add labels just to a group of genes (passing the "nice" cut off),
+# it is necessary to set some conditions to select just that group:
+cond1 <- !( (abs(d.volcano$log2FoldChange) <= cutoff_fold) | (d.volcano$padj > cutoff_alpha) )
+cond2 <- !( (abs(d.volcano$log2FoldChange) <= fld_nice) & (d.volcano$padj > ctf_nice) )
+cond <- cond1 & cond2
+
+
+#############################################
+# Volcano Plot using ggplot2 and text repel #
+#############################################
+p.volcano <- ggplot() + theme_bw() +
+  # Plot limits:
+  scale_y_continuous(expand = c(0,0),
+                     limits = c(0, max(-log10(d.volcano$padj)) + 1),
+                     minor_breaks = seq(0, 5 * (max(-log10(d.volcano$padj)) %/% 5 + 5), by = 1)) +
+  scale_x_continuous(expand = c(0,0),
+                     limits = c(min(d.volcano$log2FoldChange) -1, max(d.volcano$log2FoldChange) + 1),
+                     breaks = seq(5 * (min(d.volcano$log2FoldChange)) %/% 5,
+                                  5 * (max(d.volcano$log2FoldChange)) %/% 5, by = 5),
+                     minor_breaks = seq(5 * (min(d.volcano$log2FoldChange)) %/% 5 - 5,
+                                        5 * (max(d.volcano$log2FoldChange)) %/% 5 + 5, by = 1)) +
+  # Vertical lines and labels:
+  geom_vline(xintercept = c(-cutoff_fold, cutoff_fold), color = "red", alpha = 0.8, linetype = 2) +
+  geom_text(aes(x = -cutoff_fold - 0.75, y = max(-log10(d.volcano$padj) + 0.75),
+                label = paste("x =", -cutoff_fold)), color = "red") +
+  geom_text(aes(x = cutoff_fold + 0.75, y = max(-log10(d.volcano$padj) + 0.75),
+                label = paste("x =", cutoff_fold)), color = "red") +
+  # Horizontal line and label:
+  geom_hline(yintercept = -log10(cutoff_alpha), colour = "red", alpha = 0.8, linetype = 2) +
+  geom_text(aes(x = min(d.volcano$log2FoldChange) + 0.25, y = -log10(cutoff_alpha) - 0.25,
+                label = paste("p =", cutoff_alpha)), color = "red") +
+  # Rectangles with colors:
+  geom_rect(aes(xmin = -fld_nice, xmax = fld_nice, ymin = 0, ymax = -log10(cutoff_alpha)),
+            fill="mistyrose", alpha = 0.4, inherit.aes = FALSE) +
+  geom_rect(aes(xmin = -cutoff_fold, xmax = cutoff_fold, ymin = 0, ymax = -log10(ctf_nice)),
+            fill="mistyrose", alpha = 0.4, inherit.aes = FALSE) +
+  geom_rect(aes(xmin = -fld_nice, xmax = -cutoff_fold, ymin = -log10(cutoff_alpha), ymax = -log10(ctf_nice)),
+            fill="lightgoldenrodyellow", alpha = 0.5, inherit.aes = FALSE) +
+  geom_rect(aes(xmin = cutoff_fold, xmax = fld_nice, ymin = -log10(cutoff_alpha), ymax = -log10(ctf_nice)),
+            fill="lightgoldenrodyellow", alpha = 0.5, inherit.aes = FALSE) +
+  # Datapoints, in different colors:
+  geom_point(data = d.volcano,
+             aes(x = d.volcano$log2FoldChange, y = -log10(d.volcano$padj), fill = d.volcano$colors),
+             size = 1.5, pch=21, color = "gray10", alpha = 0.7, show.legend = TRUE) +
+  # Legend
+  scale_fill_manual(name = "Relative expression",
+                     values = c("over" = "springgreen", "under" = "deepskyblue",
+                                "middle" = "yellow", "worst" = "firebrick1", "other" = "tan1"),
+                     breaks = c("over", "under"), labels = c("Overexpressed", "Underexpressed")) +
+  guides(fill = guide_legend(override.aes = list(size=8))) + theme(legend.position = c(0.90, 0.92)) +
+  # Labels for the datapoints selected:
+  geom_text_repel(aes(x = d.volcano$log2FoldChange[cond],
+                      y = -log10(d.volcano$padj[cond]),
+                      label = d.volcano$symbol[cond]),
+                  inherit.aes = FALSE, parse = FALSE, max.iter = 5000, color = "black", cex = 3,
+                  nudge_x = 0.2, nudge_y = 0.2, segment.alpha = 0.5, segment.size = 0.5,
+                  arrow = arrow(length = unit(0.005, "npc"), type = "closed"),
+                  box.padding = unit(0.1, "lines"), min.segment.length = unit(0.01, "lines")) +
+  # Axis labels:
+  labs(x = expression("log"[2]*"(Fold Change)"),
+       y = expression("-log"[10]*"(p adjusted)"),
+       title = "Tumor vs Normal")
+
+p.volcano
+
+ggsave("VolcanoPlot.jpg", p.volcano, width = 16, height = 9, dpi = 300)
+```
+
+### HeatMap
+```{r, echo=FALSE}
+###########
+# HeatMap #
+###########
+# This heatmap function also clusters by genes
+
+# Variance stabilized data:
+varst.data <- getVarianceStabilizedData(ds.deseq)
+
+# Plot the heatmap
+pheatmap(varst.data, cluster_rows = TRUE, show_rownames = FALSE, kmeans_k = 500,
+         annotation = data.frame(sampledata[, c(2,4)]),
+         filename = "HeatMap.jpg", width = 16, height = 9) 
+```
+
+### BoxPlot and ScatterPlot
+After the differential expression analysis, the genes of interest can be further analyzed individually using
+boxplot and scatterplots.
+
+#### Function to make nice BoxPlots + ScatterPlots
+```{r, echo=FALSE}
+################################
+# BoxPlot including datapoints #
+################################
+# This function will make a Boxplot, but showing also the datapoints on top but
+# with an small deviation (jitter) for a better visualization
+plotBoxScatter_DR <- function (genename = NULL, symbol = NULL, colors = NULL, poster = NULL)
+{
+  # Extracting the vector of counts for that gene
+  gene_counts <- counts(ds.deseq, normalized = TRUE)[genename, ]
+  
+  # Making a dataframe for the plot
+  df.box <- data.frame(ds.deseq@colData[, c("sample_id", "sample_type", "tumor_status")], gene_counts)
+  
+  # Re-ordering sample_type for the plot
+  df.box$sample_type <- factor(df.box$sample_type,
+                               levels = c("Normal", "Tumor"),
+                               labels=c("N", "T"))
+  
+  # Plot
+  p.bs <- ggplot(df.box, aes(x = df.box$sample_type, y = log2(df.box$gene_counts))) +
+    theme_bw() + geom_boxplot(width = 0.8, fill = "gray90") +
+    labs(title = paste0("Gene: ", symbol, " (", genename, ")")) +
+    labs(x = expression("Sample Type"),
+         y = expression("log"[2]*"(Normalized Gene Counts)"),
+         title = paste0("Gene: ", symbol, " (", genename, ")")) +
+    geom_point(aes(fill = df.box$tumor_status),
+               size = 6, alpha = 0.8, color = "black",
+               position = position_jitter(width = 0.35)) +
+    theme(axis.text.x = element_text(size = 20),
+          axis.text.y = element_text(size = 16)) +
+    scale_fill_manual(name = "Tumor Status", values = colors,
+                      guide = guide_legend(override.aes = aes(shape = 21, size = 9)))
+
+  return(p.bs)
+}
+```
+
+Making plots for some genes of interest:
+```{r, echo=FALSE}
+# The genes of interest should be provided in a .tsv table:
+interesting_genes <- data.frame(read.csv("genes_overexp.tsv", sep = "\t", header = TRUE))
+interesting_genes <- data.frame(read.csv("genes_underexp.tsv", sep = "\t", header = TRUE))
+
+# Then, this loop will make and save the plots for all the genes in the table
+# Create the folders accordingly
+for (i in 1:nrow(interesting_genes)) {
+  ggsave(paste0("By_Gene/Underexp/", interesting_genes[i, 2], ".jpg"),
+         width = 16, height = 10, dpi = 300,
+         plotBoxScatter_DR(toString(interesting_genes[i, 1]),
+                           toString(interesting_genes[i, 2]),
+                           colors = nice_colors, poster = F))
+}
+
+# To make and save the plot of one specific gene (e.g. MALAT1):
+ggsave("MALAT1.jpg", width = 6, height = 8, dpi = 300,
+       plotBoxScatter_DR("ENSG00000251562", "MALAT1", colors = nice_colors, poster = T))
+```
+
+For further guidance, check the DESeq2 Vignette:
+https://bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html
+
+And this tutorial:
+https://www.bioconductor.org/help/course-materials/2015/LearnBioconductorFeb2015/B02.1.1_RNASeqLab.html#diagnostic
